@@ -1,0 +1,231 @@
+% Test Scale
+%-------------
+% Pload=repmat(Pload,30,1);
+% PVprofile=repmat(PVprofile,30,1);
+% Horizon=24*30;
+
+%Parameters
+%--------------------------
+
+% periode de calcul 
+demih =2016*2;
+id_solve = 1:demih ;
+
+
+% Load profiles 1 an
+load('Consomation.mat')
+load('SolaireN.mat')
+load('EolienN.mat')
+
+% Load profiles 1semaine/mois
+load('Consomation_12s.mat')
+load('SolaireN_12s.mat')
+load('EolienN_12s.mat')
+
+% Load profiles 1 an
+load('Consomation_4s.mat')
+load('SolaireN_4s.mat')
+load('EolienN_4s.mat')
+
+dT=0.5;
+Horizon=length(Consomation_12s(id_solve));
+nb_s= 12;
+
+% Load3
+
+LOAD_P=Consomation_12s(id_solve);
+
+% Pv
+Ppv_max=10387*10; %MW
+PV_P=SolaireN_12s(id_solve)*Ppv_max;
+
+% Eol
+
+Peol_max = 17616;
+Eol_P = EolienN_12s(id_solve)*Peol_max;
+
+%stock
+Pbat_max= 1000;
+Ebat_max = 5000;
+
+% GenSet
+Nge=5;
+%          Nucl Coal   Oil   Gas  Hydro  
+GEN_P_Max=[61370, 2978 , 3389.4 , 12567.2, 25731.8];
+GEN_cost=[72 , 22, 102.1, 480 , 2];
+GEN_co2=[6, 1058 , 730 , 418 ,0];
+LF_max=[62.4  5.4 5.7 31.3 28.9];
+
+% def Matrice Lissage
+
+n = Horizon;
+M = zeros(n-1,n);
+for ligne = 1:n-1
+        M(ligne,ligne) = -1;
+        M(ligne,ligne+1) = 1;
+end
+
+% Def matrice hydo
+M_hydro=zeros(nb_s,Horizon);
+Hs=7*48;
+for ligne=1:12
+    M_hydro(ligne, (ligne-1)*Hs+1 : ligne*Hs) = 1 ;
+end
+load('Hydraulique_prod_12s.mat')
+b_hydro=Hydraulique_production_12s/2;
+
+% Stockage
+Mbat=zeros(n , n+1);
+for ligne=1:n
+     Mbat(ligne, ligne ) = -1;
+     Mbat(ligne, ligne+1 ) = 1;  
+end
+
+
+% Variables + Bounds
+%--------------------------
+disp('Declare Variables ...')
+
+% Genset power
+GEN_P=optimvar('GEN_P', Horizon,Nge); % matrice de dimension n avec la charge max de chaque générateur.  
+GEN_P.LowerBound=0;
+GEN_P.UpperBound=repmat(GEN_P_Max, Horizon, 1);
+
+
+% Var stock 
+Pbat = optimvar('Pbat',Horizon,1) ;
+Pbat.LowerBound=-Pbat_max;
+Pbat.UpperBound=Pbat_max;
+
+Ebat = optimvar('Ebat',Horizon+1,1); 
+Ebat.LowerBound=0;
+Ebat.UpperBound=Ebat_max;
+
+% PV curtailment
+PV_deltaP=optimvar('PV_deltaP', Horizon,1); 
+PV_deltaP.LowerBound=0;
+PV_deltaP.UpperBound=PV_P;
+
+% Eol curtailement
+Eol_deltaP=optimvar('Eol_deltaP', Horizon,1); 
+Eol_deltaP.LowerBound=0;
+Eol_deltaP.UpperBound=Eol_P;
+
+% Write Objective
+%-------------------------
+disp('Declare Objective ...')
+        Objective=  sum(sum(GEN_P.*repmat(GEN_cost,Horizon,1)));
+                    
+% Write Constraints
+%-------------------------
+disp('Declare Constraints ...')
+
+PowerBalance = sum(GEN_P,2) + (PV_P - PV_deltaP)  + (Eol_P - Eol_deltaP)  - Pbat...
+              ==   LOAD_P  ;
+
+%Pbat = Pbat_dis == Pbat_dis - PV_P - Eol_P 
+    
+%contraintes hydro
+
+Contraintes_hydro= M_hydro*GEN_P(:,5) <=   b_hydro;
+
+% Model Batterie
+BatMan = Mbat*Ebat*dT == Pbat ;       
+BatEinit= Ebat(1)== Ebat_max/2;
+BatEend= Ebat(end)== Ebat_max/2;
+
+
+% EolLim = Eol_P >= abs((1/2)*Pbat);
+% PvLim = PV_P >= abs((1/2)*Pbat);
+                            
+% GEN_Pgen_High =  GEN_P <= repmat(GEN_P_Max, Horizon, 1);
+% 
+% GEN_Pgen_Low =   GEN_P >=  0;
+       
+LFmax =  sum(GEN_P,1)*dT <= (LF_max/100).*GEN_P_Max*Horizon*dT;
+LFmin =  sum(GEN_P,1)*dT >= (0.5/100).*GEN_P_Max*Horizon*dT;
+
+CurtailMax_PV =  sum(PV_deltaP*dT)/sum(PV_P)*100 <= 100;
+CurtailMax_Eol = sum(Eol_deltaP*dT)/sum(Eol_P)*100 <= 100;
+
+
+%Lissage hydro MAT
+Ah = GEN_P(:,5); %optimvar hyd 
+Bh =M*Ah; % P(t+1) - p(t) variation
+Ch = Ah(2:demih);% (p(t+1)) décalé
+Eh = 0.05*Ch; %p(t) * 5%
+%Variables contraintes 
+Variation_hydro_i = ( Bh <= Eh );
+Variation_hydro_s = ( Bh >= -Eh ) ;
+
+
+%Lissage Gas
+Ag = GEN_P(:,4); %optimvar gas
+Bg =M*Ag; % P(t+1) - p(t) 
+Cg = Ag(2:demih);% (p(t)) 
+Eg = 0.05*Cg;
+%Variables contraintes 
+Variation_gas_i = ( Bg <= Eg );
+Variation_gas_s = ( Bg >= -Eg ) ;
+
+
+%Lissage  Oil
+Ao = GEN_P(:,3); %optimvar gas
+Bo =M*Ao; % P(t+1) - p(t) 
+Co = Ao(2:demih);% (p(t)) 
+Eo = 0.05*Co;
+%Variables contraintes 
+Variation_oil_i = ( Bo <= Eo );
+Variation_oil_s = ( Bo >= -Eo ) ;
+
+
+
+
+
+% Write & Sovle Problem
+%-------------------------      
+disp('Write Problem ...')
+OPT_Management=optimproblem('ObjectiveSense','min');
+OPT_Management.Objective=Objective;
+OPT_Management.Constraints.PowerBalance=PowerBalance;
+OPT_Management.Constraints.BatMan=BatMan;
+OPT_Management.Constraints.BatEinit=BatEinit;
+OPT_Management.Constraints.BatEend=BatEend;
+% OPT_Management.Constraints.EolLim=EolLim;
+% OPT_Management.Constraints.PvLim=PvLim;
+OPT_Management.Constraints.LFmax=LFmax;
+% OPT_Management.Constraints.CurtailMax_Pbat=CurtailMax_Pbat;
+OPT_Management.Constraints.CurtailMax_PV=CurtailMax_PV;
+OPT_Management.Constraints.CurtailMax_Eol=CurtailMax_Eol;
+OPT_Management.Constraints.Variation_hydro_i=Variation_hydro_i;
+OPT_Management.Constraints.Variation_hydro_s=Variation_hydro_s;
+OPT_Management.Constraints.Variation_gas_i=Variation_gas_i;
+OPT_Management.Constraints.Variation_gas_s=Variation_gas_s;
+OPT_Management.Constraints.Variation_oil_i=Variation_oil_i;
+OPT_Management.Constraints.Variation_oil_s=Variation_oil_s;
+OPT_Management.Constraints.Contraintes_hydro=Contraintes_hydro;
+
+
+disp('Solve Problem ...')
+options_SOLVER=optimoptions(OPT_Management);
+options_SOLVER.MaxTime=600;
+options_SOLVER.ConstraintTolerance=1e-3;
+[sol,fval,exitflag,output] = solve(OPT_Management, 'Options',options_SOLVER );
+
+
+%% Extract Results and Display
+%----------------------------
+figure()
+id_plot=id_solve;
+% Pbat=sol.Pbat(id_plot);
+area( [  PV_P(id_plot)-sol.PV_deltaP(id_plot)  Eol_P(id_plot)-sol.Eol_deltaP(id_plot)  -min(sol.Pbat,0)  sol.GEN_P(id_plot,:)  ]  );  
+hold on
+plot(LOAD_P(id_plot), 'k', 'linewidth', 4);
+xlabel('Time')
+ylabel('Power (kW)')
+legend('PV', 'Eol','Stock Disch', 'Nucleaire' , 'Coal' , 'Oil' , 'Gas', 'Hydro' , 'load')
+
+figure()
+Ttest=48;
+subplot(2,1,1),plot(sol.Pbat(1:Ttest))
+subplot(2,1,2), plot(sol.Ebat(1:Ttest))
